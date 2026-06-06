@@ -51,7 +51,6 @@ from dlt._workspace.deployment.typing import (
     TJobsDeploymentManifest,
     TRuntimeEntryPoint,
     TTrigger,
-    resolve_incremental_mode,
     resolve_refresh_propagation,
 )
 
@@ -312,13 +311,17 @@ def resolve_interval(
 def build_runtime_entry_point(
     job_def: TJobDefinition,
     cli_config: Dict[str, str],
-    profile: str,
+    profile: Optional[str],
     refresh: bool,
-    interval_start: datetime,
-    interval_end: datetime,
-    tz: str,
+    interval_start: Optional[datetime],
+    interval_end: Optional[datetime],
+    tz: Optional[str] = None,
 ) -> TRuntimeEntryPoint:
-    """Assemble a `TRuntimeEntryPoint` from a job def and resolved context, without mutating `job_def`."""
+    """Assemble a `TRuntimeEntryPoint` from a job def and resolved context, without mutating `job_def`.
+
+    Intervals are serialized in UTC; `tz` (defaults to `require.timezone`) carries the
+    IANA zone re-applied by the launcher at the user boundary.
+    """
     entry_point: TRuntimeEntryPoint = copy.copy(job_def["entry_point"])  # type: ignore[assignment]
 
     if cli_config:
@@ -327,19 +330,28 @@ def build_runtime_entry_point(
         entry_point["config"] = merged
 
     if entry_point.get("job_type") == "interactive":
-        entry_point["run_args"] = {"port": 5000}
+        entry_point.setdefault("run_args", {"port": 5000})
 
-    entry_point["interval_start"] = interval_start.isoformat()
-    entry_point["interval_end"] = interval_end.isoformat()
-    entry_point["interval_timezone"] = tz
-    # pass mode explicitly when set, keep deprecated flag for old launchers and backends
-    mode = resolve_incremental_mode(job_def)
-    if job_def.get("incremental_mode") is not None:
+    if tz is None:
+        tz = job_def.get("require", {}).get("timezone", "UTC")
+    if interval_start is not None:
+        entry_point["interval_start"] = ensure_datetime_utc(interval_start).isoformat()
+    if interval_end is not None:
+        entry_point["interval_end"] = ensure_datetime_utc(interval_end).isoformat()
+    if interval_start is not None or interval_end is not None:
+        entry_point["interval_timezone"] = tz
+    # pass mode explicitly when set, keep deprecated flag for old launchers and backends.
+    # unset jobs get neither key so launcher-side `jobs` configuration may apply
+    mode = job_def.get("incremental_mode")
+    if mode is None and job_def.get("allow_external_schedulers") is not None:
+        mode = "interval" if job_def["allow_external_schedulers"] else "pipeline"
+    if mode is not None:
         entry_point["incremental_mode"] = mode
-    entry_point["allow_external_schedulers"] = mode == "interval"
+        entry_point["allow_external_schedulers"] = mode == "interval"
     if job_def.get("auto_refresh_pipeline_mode"):
         entry_point["auto_refresh_pipeline_mode"] = job_def["auto_refresh_pipeline_mode"]
-    entry_point["profile"] = profile
+    if profile:
+        entry_point["profile"] = profile
     entry_point["refresh"] = refresh
     execute_spec = job_def.get("execute") or {}
     if "intercept_signals" in execute_spec:

@@ -342,7 +342,7 @@ def test_job_definition_batch() -> None:
 
 
 def test_job_definition_incremental_mode() -> None:
-    """`incremental_mode` serializes as the backward-compatible flag; default emits nothing."""
+    """`incremental_mode` serializes as the backward-compatible flag; unset emits nothing."""
 
     @job(incremental_mode="interval", interval={"start": "2024-01-01T00:00:00Z"})
     def interval_etl():
@@ -352,12 +352,21 @@ def test_job_definition_incremental_mode() -> None:
     assert job_def["allow_external_schedulers"] is True
     assert "incremental_mode" not in job_def
 
-    # pipeline mode (also the default) emits neither field
+    # explicit pipeline mode serializes as False so it survives `jobs` config defaults
     @job(incremental_mode="pipeline")
     def pipeline_etl():
         pass
 
     job_def = pipeline_etl.to_job_definition()
+    assert job_def["allow_external_schedulers"] is False
+    assert "incremental_mode" not in job_def
+
+    # unset emits neither field
+    @job
+    def default_etl():
+        pass
+
+    job_def = default_etl.to_job_definition()
     assert "allow_external_schedulers" not in job_def
     assert "incremental_mode" not in job_def
 

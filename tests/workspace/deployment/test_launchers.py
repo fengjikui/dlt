@@ -267,6 +267,12 @@ def test_job_launcher_auto_refresh_pipeline_mode(
             None,
         ),
         (
+            {"allow_external_schedulers": False},
+            {"JOBS__INCREMENTAL_MODE": "interval"},
+            "pipeline",
+            None,
+        ),
+        (
             {},
             {
                 "JOBS__INCREMENTAL_MODE": "pipeline",
@@ -283,6 +289,7 @@ def test_job_launcher_auto_refresh_pipeline_mode(
         "explicit-mode-wins",
         "explicit-refresh-wins",
         "legacy-flag-is-explicit",
+        "legacy-false-is-explicit-pipeline",
         "per-job-section-wins",
         "nothing-set",
     ],

@@ -12,6 +12,7 @@ from uuid import uuid4
 from dlt.common import json
 from dlt.common.pendulum import pendulum
 from dlt._workspace.deployment._job_ref import resolve_job_ref, short_name as job_short_name
+from dlt._workspace.deployment._run_helpers import build_runtime_entry_point
 from dlt._workspace.deployment.freshness import (
     get_refresh_cascade_targets,
 )
@@ -23,7 +24,6 @@ from dlt._workspace.deployment.typing import (
     TJobRef,
     TRuntimeEntryPoint,
     TTrigger,
-    resolve_incremental_mode,
     resolve_refresh_propagation,
 )
 from dlt._workspace.deployment.interval import (
@@ -387,25 +387,11 @@ def _start_job(
         for ds_ref in get_refresh_cascade_targets(job_ref, _all_jobs_map):
             _freshness_store.clear_prev_completed_run(ds_ref)
 
-    entry_point: TRuntimeEntryPoint = dict(job_def["entry_point"])  # type: ignore[assignment]
-
-    if _config:
-        entry_point["config"] = dict(_config)
-    job_type = entry_point["job_type"]
-
-    if job_type == "interactive":
-        entry_point["run_args"] = {"port": port_counter[0]}
-        port_counter[0] += 1
-
     now = datetime.now(timezone.utc)
     refresh_signal = False
     eff_interval: Optional[TTimeInterval] = interval
 
-    if interval is not None:
-        # interval-store path: caller computed the interval, no refresh signal
-        entry_point["interval_start"] = interval[0].isoformat()
-        entry_point["interval_end"] = interval[1].isoformat()
-    elif not _is_interval_job(job_def):
+    if interval is None and not _is_interval_job(job_def):
         # non-interval path: derive refresh signal + interval from prev_completed_run.
         # use default_trigger when present so an event-dispatched job (job.success,
         # manual, etc.) still computes its interval against its scheduling cron rather
@@ -413,33 +399,34 @@ def _start_job(
         tz = job_def.get("require", {}).get("timezone", "UTC")
         prev = _freshness_store.get_prev_completed_run(job_ref)
         refresh_signal = prev is None
-        entry_point["refresh"] = refresh_signal
         interval_trigger = job_def.get("default_trigger") or trigger
         eff_interval = compute_run_interval(interval_trigger, now, prev, tz=tz)
-        entry_point["interval_start"] = eff_interval[0].isoformat()
-        entry_point["interval_end"] = eff_interval[1].isoformat()
 
-    # propagate incremental mode and timezone to launcher (only meaningful
-    # when an interval is provided). timezone is re-applied at the launcher boundary
-    # so the user-facing interval carries its IANA identity across JSON round-trip.
-    if "interval_start" in entry_point:
-        mode = resolve_incremental_mode(job_def)
-        if job_def.get("incremental_mode") is not None:
-            entry_point["incremental_mode"] = mode
-        entry_point["allow_external_schedulers"] = mode == "interval"
-        entry_point["interval_timezone"] = job_def.get("require", {}).get("timezone", "UTC")
-
-    if job_def.get("auto_refresh_pipeline_mode"):
-        entry_point["auto_refresh_pipeline_mode"] = job_def["auto_refresh_pipeline_mode"]
-
-    # pass profile from require spec
     require = job_def.get("require", {})
-    if "profile" in require:
-        entry_point["profile"] = require["profile"]
+    if eff_interval is not None:
+        entry_point = build_runtime_entry_point(
+            job_def,
+            dict(_config) if _config else {},
+            require.get("profile"),
+            refresh_signal,
+            eff_interval[0],
+            eff_interval[1],
+            require.get("timezone", "UTC"),
+        )
+    else:
+        # interval-store job dispatched without a computed interval
+        entry_point = dict(job_def["entry_point"])  # type: ignore[assignment]
+        if _config:
+            entry_point["config"] = dict(_config)
+        if "profile" in require:
+            entry_point["profile"] = require["profile"]
+        execute_spec = job_def.get("execute") or {}
+        if "intercept_signals" in execute_spec:
+            entry_point["intercept_signals"] = execute_spec["intercept_signals"]
 
-    execute_spec = job_def.get("execute") or {}
-    if "intercept_signals" in execute_spec:
-        entry_point["intercept_signals"] = execute_spec["intercept_signals"]
+    if entry_point["job_type"] == "interactive":
+        entry_point["run_args"] = {"port": port_counter[0]}
+        port_counter[0] += 1
 
     # select launcher
     launcher = entry_point.get("launcher")
@@ -464,7 +451,7 @@ def _start_job(
     short = _short(job_ref)
     _log_job(short, 2, f"starting (trigger: {trigger})")
 
-    if job_type == "interactive":
+    if entry_point["job_type"] == "interactive":
         port = entry_point["run_args"]["port"]
         _log_job(short, 2, f"listening on http://localhost:{port}")
 

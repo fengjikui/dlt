@@ -3,7 +3,7 @@ from fnmatch import fnmatch
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
-from dlt.common.time import ensure_pendulum_datetime_utc
+from dlt.common.time import ensure_datetime_utc
 from dlt.common.typing import TAnyDateTime
 from dlt._workspace.deployment._job_ref import resolve_job_ref, short_name as _job_short_name
 from dlt._workspace.deployment.exceptions import InvalidTrigger
@@ -72,7 +72,7 @@ def _parse_once(expr: str) -> TParsedTrigger:
     if not expr:
         raise InvalidTrigger(f"once:{expr}", "requires a timestamp (ISO 8601)")
     try:
-        dt = ensure_pendulum_datetime_utc(expr)
+        dt = ensure_datetime_utc(expr)
     except (ValueError, TypeError):
         raise InvalidTrigger(f"once:{expr}", "requires ISO 8601 timestamp")
     return TParsedTrigger(type="once", expr=dt, raw=TTrigger(f"once:{expr}"))

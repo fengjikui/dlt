@@ -174,5 +174,8 @@ class _IntervalAccessor:
         ctx.interval = full_days_interval(cur)
         return self
 
+    def __str__(self) -> str:
+        return str(self())
+
 
 interval = _IntervalAccessor()

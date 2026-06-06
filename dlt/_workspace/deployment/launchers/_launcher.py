@@ -94,8 +94,11 @@ def apply_job_configuration(entry_point: TRuntimeEntryPoint, job_name: Optional[
     explicit: Dict[str, Any] = {}
     if entry_point.get("incremental_mode"):
         explicit["incremental_mode"] = entry_point["incremental_mode"]
-    elif entry_point.get("allow_external_schedulers"):
-        explicit["incremental_mode"] = "interval"
+    elif entry_point.get("allow_external_schedulers") is not None:
+        # the legacy flag is set both ways for explicit modes, False means `pipeline`
+        explicit["incremental_mode"] = (
+            "interval" if entry_point["allow_external_schedulers"] else "pipeline"
+        )
     if entry_point.get("auto_refresh_pipeline_mode"):
         explicit["auto_refresh_pipeline_mode"] = entry_point["auto_refresh_pipeline_mode"]
     config = resolve_configuration(

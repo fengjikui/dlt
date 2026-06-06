@@ -5,6 +5,7 @@ import io
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone  # noqa: I251
 from contextlib import contextmanager
 from copy import copy
 from importlib import import_module
@@ -13,7 +14,6 @@ from types import ModuleType
 
 from dlt.common import json
 from dlt.common.exceptions import DictValidationException
-from dlt.common.pendulum import pendulum
 from dlt.common.time import ensure_datetime_utc
 from dlt.common.typing import DictStrAny
 from dlt.common.validation import validate_dict
@@ -59,7 +59,8 @@ from dlt._workspace.deployment.typing import (
     resolve_refresh_propagation,
 )
 
-DEPLOYMENT_ENGINE_VERSION = MANIFEST_ENGINE_VERSION
+DEPLOYMENT_ENGINE_VERSION = 1
+"""Engine version of package files manifests (`TFilesManifest`), independent of job definitions."""
 
 _HASH_EXCLUDE_KEYS = ("version", "version_hash", "previous_hashes", "created_at")
 _MAX_PREVIOUS_HASHES = 10
@@ -612,7 +613,7 @@ def generate_manifest(
 
     manifest: TJobsDeploymentManifest = {
         "engine_version": MANIFEST_ENGINE_VERSION,
-        "created_at": pendulum.now("UTC").isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "deployment_module": deployment_module.__name__,
         "jobs": jobs,
     }

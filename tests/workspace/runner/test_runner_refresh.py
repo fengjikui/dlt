@@ -276,12 +276,12 @@ def test_cascade_skips_interval_store_seed(
 @pytest.mark.parametrize(
     "jd_patch,expected_allow,expected_mode",
     [
-        ({}, False, None),  # not set in manifest → entry_point gets False
-        ({"allow_external_schedulers": False}, False, None),
-        ({"allow_external_schedulers": True}, True, None),
+        ({}, None, None),  # not set in manifest → entry_point gets neither key
+        ({"allow_external_schedulers": False}, False, "pipeline"),
+        ({"allow_external_schedulers": True}, True, "interval"),
         ({"incremental_mode": "interval"}, True, "interval"),
         ({"incremental_mode": "pipeline"}, False, "pipeline"),
-        ({"auto_refresh_pipeline_mode": "drop_sources"}, False, None),
+        ({"auto_refresh_pipeline_mode": "drop_sources"}, None, None),
     ],
     ids=[
         "unset",

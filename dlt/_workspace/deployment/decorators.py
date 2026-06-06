@@ -126,7 +126,7 @@ class JobFactory(Generic[TJobFunParams, TJobResult]):
         self.deliver: Optional[TDeliverTarget] = None
         self.interval: Optional[TIntervalSpec] = None
         self.freshness: List[TFreshnessConstraint] = []
-        self.incremental_mode: TIncrementalMode = "pipeline"
+        self.incremental_mode: Optional[TIncrementalMode] = None
         self.refresh_propagation: TRefreshPolicy = "auto"
         self.auto_refresh_pipeline_mode: Optional[TRefreshMode] = None
 
@@ -226,9 +226,10 @@ class JobFactory(Generic[TJobFunParams, TJobResult]):
             job_def["interval"] = self.interval
         if self.freshness:
             job_def["freshness"] = list(self.freshness)
-        # serialize as the backward-compatible flag, `incremental_mode` is not emitted yet
-        if self.incremental_mode == "interval":
-            job_def["allow_external_schedulers"] = True
+        # serialize as the backward-compatible flag, `incremental_mode` is not emitted yet.
+        # explicit `pipeline` is serialized as False so it survives config defaults
+        if self.incremental_mode is not None:
+            job_def["allow_external_schedulers"] = self.incremental_mode == "interval"
         # serialize as the backward-compatible field, `refresh_propagation` is not emitted yet
         if self.refresh_propagation != "auto":
             job_def["refresh"] = self.refresh_propagation
@@ -262,7 +263,7 @@ def _job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    incremental_mode: TIncrementalMode = "pipeline",
+    incremental_mode: Optional[TIncrementalMode] = None,
     refresh_propagation: TRefreshPolicy = "auto",
     auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
@@ -312,7 +313,7 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    incremental_mode: TIncrementalMode = "pipeline",
+    incremental_mode: Optional[TIncrementalMode] = None,
     refresh_propagation: TRefreshPolicy = "auto",
     auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
@@ -334,7 +335,7 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    incremental_mode: TIncrementalMode = "pipeline",
+    incremental_mode: Optional[TIncrementalMode] = None,
     refresh_propagation: TRefreshPolicy = "auto",
     auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
@@ -355,7 +356,7 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    incremental_mode: TIncrementalMode = "pipeline",
+    incremental_mode: Optional[TIncrementalMode] = None,
     refresh_propagation: TRefreshPolicy = "auto",
     auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
@@ -395,8 +396,9 @@ def job(
 
         incremental_mode: How incrementals obtain their range during a run.
             `interval` - incrementals assume the interval of the job, state is
-            managed by the scheduler. `pipeline` (default) - incrementals keep
-            their own state in the pipeline.
+            managed by the scheduler. `pipeline` - incrementals keep their own
+            state in the pipeline. When not set, falls back to `jobs`
+            configuration, then to `pipeline`.
 
         refresh_propagation: Refresh-signal propagation policy. `auto` (default) passes
             through if this run had `refresh=True`. `always` always clears
@@ -534,7 +536,7 @@ def pipeline_run(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    incremental_mode: TIncrementalMode = "pipeline",
+    incremental_mode: Optional[TIncrementalMode] = None,
     refresh_propagation: TRefreshPolicy = "auto",
     auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
@@ -567,8 +569,9 @@ def pipeline_run(
 
         incremental_mode: How incrementals obtain their range during a run.
             `interval` - incrementals assume the interval of the job, state is
-            managed by the scheduler. `pipeline` (default) - incrementals keep
-            their own state in the pipeline.
+            managed by the scheduler. `pipeline` - incrementals keep their own
+            state in the pipeline. When not set, falls back to `jobs`
+            configuration, then to `pipeline`.
 
         refresh_propagation: Refresh-signal propagation policy. `auto` (default) passes
             through if this run had `refresh=True`. `always` always clears

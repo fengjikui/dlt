@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -568,7 +569,9 @@ def test_build_runtime_entry_point_batch_sets_interval_and_profile() -> None:
     assert ep["interval_timezone"] == "UTC"
     assert ep["profile"] == "prod"
     assert ep["refresh"] is True
-    assert ep["allow_external_schedulers"] is False
+    # unset incremental mode emits neither key so launcher config may apply
+    assert "allow_external_schedulers" not in ep
+    assert "incremental_mode" not in ep
     assert "run_args" not in ep
 
 
@@ -588,7 +591,7 @@ def test_build_runtime_entry_point_config_merges() -> None:
 @pytest.mark.parametrize(
     "jd_kwargs,expected_allow,expected_mode",
     [
-        ({"allow_external_schedulers": True}, True, None),
+        ({"allow_external_schedulers": True}, True, "interval"),
         ({"incremental_mode": "interval"}, True, "interval"),
         ({"incremental_mode": "pipeline"}, False, "pipeline"),
         ({"incremental_mode": "pipeline", "allow_external_schedulers": True}, False, "pipeline"),
@@ -615,6 +618,38 @@ def test_build_runtime_entry_point_propagates_auto_refresh_pipeline_mode() -> No
     jd["auto_refresh_pipeline_mode"] = "drop_sources"
     ep = build_runtime_entry_point(jd, {}, "dev", True, NOW, NOW, "UTC")
     assert ep["auto_refresh_pipeline_mode"] == "drop_sources"
+
+
+def test_build_runtime_entry_point_optional_interval_and_utc() -> None:
+    """No interval bounds emit no interval keys; non-UTC bounds serialize as UTC."""
+    jd = _job("jobs.a")
+    ep = build_runtime_entry_point(jd, {}, "dev", False, None, None)
+    assert "interval_start" not in ep
+    assert "interval_end" not in ep
+    assert "interval_timezone" not in ep
+
+    # non-UTC inputs are converted to UTC in transit, tz derives from require.timezone
+    jd = _job("jobs.a", require={"timezone": "Europe/Berlin"})
+    berlin = ZoneInfo("Europe/Berlin")
+    ep = build_runtime_entry_point(
+        jd,
+        {},
+        "dev",
+        False,
+        datetime(2024, 1, 15, 1, 0, tzinfo=berlin),
+        datetime(2024, 1, 16, 1, 0, tzinfo=berlin),
+    )
+    assert ep["interval_start"] == "2024-01-15T00:00:00+00:00"
+    assert ep["interval_end"] == "2024-01-16T00:00:00+00:00"
+    assert ep["interval_timezone"] == "Europe/Berlin"
+
+
+def test_build_runtime_entry_point_keeps_preset_run_args() -> None:
+    """Interactive run_args provided by the caller are not overwritten."""
+    jd = _job("jobs.dash", job_type="interactive")
+    jd["entry_point"]["run_args"] = {"port": 8080}  # type: ignore[typeddict-unknown-key]
+    ep = build_runtime_entry_point(jd, {}, "dev", False, NOW, NOW, "UTC")
+    assert ep["run_args"] == {"port": 8080}
 
 
 def test_build_runtime_entry_point_does_not_mutate_job_def() -> None:
