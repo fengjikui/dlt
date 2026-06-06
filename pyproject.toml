@@ -508,6 +508,7 @@ module = [
     "pyiceberg.*",
     "airflow.*",
     "dlthub.*",
+    "dlt_runtime.*",
     "ibis.*",
     "adbc_driver_postgresql.*",
     "adbc_driver_manager.*",

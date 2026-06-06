@@ -55,6 +55,8 @@ from dlt._workspace.deployment.typing import (
     TJobDefinition,
     TJobRef,
     TTrigger,
+    resolve_incremental_mode,
+    resolve_refresh_propagation,
 )
 
 DEPLOYMENT_ENGINE_VERSION = MANIFEST_ENGINE_VERSION
@@ -109,13 +111,49 @@ def bump_manifest_version(
     return version, new_hash, old_hash
 
 
+def migrate_job_definition(
+    job_dict: DictStrAny, from_engine: int, to_engine: int
+) -> TJobDefinition:
+    """Migrate a single job definition dict between engine versions, in place.
+
+    Job definitions do not carry an engine version - the caller provides both versions.
+    """
+    if from_engine == to_engine:
+        return job_dict  # type: ignore[return-value]
+    if from_engine == 1 and to_engine > 1:
+        # engine 2: allow_external_schedulers is replaced by incremental_mode
+        if job_dict.pop("allow_external_schedulers", None):
+            job_dict["incremental_mode"] = "interval"
+        # engine 2: refresh is replaced by refresh_propagation
+        refresh = job_dict.pop("refresh", None)
+        if refresh is not None:
+            job_dict["refresh_propagation"] = refresh
+        from_engine = 2
+
+    if from_engine != to_engine:
+        raise ValueError(
+            f"no job definition migration path from engine {from_engine} to {to_engine}"
+        )
+    return job_dict  # type: ignore[return-value]
+
+
 def migrate_manifest(
     manifest_dict: DictStrAny, from_engine: int, to_engine: int
 ) -> TJobsDeploymentManifest:
     """Migrate a manifest dict between engine versions."""
     if from_engine == to_engine:
         return manifest_dict  # type: ignore[return-value]
-    raise ValueError(f"no manifest migration path from engine {from_engine} to {to_engine}")
+    for job in manifest_dict.get("jobs", []):
+        migrate_job_definition(job, from_engine, to_engine)
+    # manifest-level migrations per engine version
+    if from_engine == 1 and to_engine > 1:
+        # engine 2: no manifest-level changes
+        from_engine = 2
+
+    if from_engine != to_engine:
+        raise ValueError(f"no manifest migration path from engine {from_engine} to {to_engine}")
+    manifest_dict["engine_version"] = to_engine
+    return manifest_dict  # type: ignore[return-value]
 
 
 def save_manifest(manifest: TJobsDeploymentManifest, f: BinaryIO) -> str:
@@ -302,8 +340,17 @@ def validate_job_definition(
                         f" cron tick for {cron_expr!r} — will be snapped backward"
                     )
 
-    if job_def.get("allow_external_schedulers") and not has_interval:
-        warnings.append(f"job {ref!r} has allow_external_schedulers but no interval")
+    if resolve_incremental_mode(job_def) == "interval" and not has_interval:
+        warnings.append(f"job {ref!r} has incremental_mode 'interval' but no interval")
+
+    if (
+        job_def.get("auto_refresh_pipeline_mode")
+        and resolve_refresh_propagation(job_def) == "block"
+    ):
+        warnings.append(
+            f"job {ref!r} has auto_refresh_pipeline_mode but refresh_propagation 'block'"
+            " prevents refresh runs"
+        )
 
     declared_profile = (job_def.get("require") or {}).get("profile")
     if declared_profile is not None and is_local_profile(declared_profile):

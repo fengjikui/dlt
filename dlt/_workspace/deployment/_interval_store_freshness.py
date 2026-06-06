@@ -24,7 +24,7 @@ try:
 except ModuleNotFoundError:
     raise MissingDependencyException(
         "dltHub workspace",
-        [f"{version.DLT_PKG_NAME}[workspace]"],
+        [f"{version.DLT_PKG_NAME}[hub]"],
     )
 
 
@@ -37,7 +37,7 @@ def sort_and_coalesce(intervals: Sequence[TTimeInterval]) -> List[TTimeInterval]
     for iv in sorted_ivs[1:]:
         prev_start, prev_end = merged[-1]
         if iv[0] <= prev_end:
-            merged[-1] = (prev_start, max(prev_end, iv[1]))
+            merged[-1] = TTimeInterval(prev_start, max(prev_end, iv[1]))
         else:
             merged.append(iv)
     return merged
@@ -74,7 +74,7 @@ def iter_intervals(
         if next_naive <= end_naive:
             tick_utc = tick_naive.replace(tzinfo=target_tz).astimezone(timezone.utc)
             next_utc = next_naive.replace(tzinfo=target_tz).astimezone(timezone.utc)
-            yield (tick_utc, next_utc)
+            yield TTimeInterval(tick_utc, next_utc)
         tick_naive = next_naive
 
 
@@ -94,7 +94,7 @@ def get_eligible_intervals(
     """
     effective_start, comp_idx = _trim_leading_completed(overall[0], completed)
     result: List[TTimeInterval] = []
-    for iv in iter_intervals(cron_expr, (effective_start, overall[1]), tz=tz):
+    for iv in iter_intervals(cron_expr, TTimeInterval(effective_start, overall[1]), tz=tz):
         while comp_idx < len(completed) and completed[comp_idx][1] <= iv[0]:
             comp_idx += 1
         if (
@@ -122,7 +122,7 @@ def next_eligible_interval(
         tz: IANA timezone for cron evaluation. Returned interval is UTC.
     """
     effective_start, comp_idx = _trim_leading_completed(overall[0], completed)
-    for interval in iter_intervals(cron_expr, (effective_start, overall[1]), tz=tz):
+    for interval in iter_intervals(cron_expr, TTimeInterval(effective_start, overall[1]), tz=tz):
         # advance past completed ranges that end before this interval
         while comp_idx < len(completed) and completed[comp_idx][1] <= interval[0]:
             comp_idx += 1
@@ -209,7 +209,7 @@ def resolve_interval_freshness_checks(
             checks.append(
                 TIntervalFreshnessCheck(
                     upstream_ref=upstream_ref,
-                    effective_interval=(effective_start, effective_end),
+                    effective_interval=TTimeInterval(effective_start, effective_end),
                     reason_if_not_completed=(
                         f"upstream {upstream_ref} not fresh"
                         f" for [{effective_start}, {effective_end})"
@@ -230,7 +230,7 @@ def resolve_interval_freshness_checks(
             checks.append(
                 TIntervalFreshnessCheck(
                     upstream_ref=upstream_ref,
-                    effective_interval=(effective_start, effective_end),
+                    effective_interval=TTimeInterval(effective_start, effective_end),
                     reason_if_not_completed=(
                         f"upstream {upstream_ref} not fully fresh for overall interval"
                     ),

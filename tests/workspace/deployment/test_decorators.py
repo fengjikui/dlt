@@ -341,6 +341,58 @@ def test_job_definition_batch() -> None:
     assert job_def["description"] == "Daily ETL."
 
 
+def test_job_definition_incremental_mode() -> None:
+    """`incremental_mode` serializes as the backward-compatible flag; default emits nothing."""
+
+    @job(incremental_mode="interval", interval={"start": "2024-01-01T00:00:00Z"})
+    def interval_etl():
+        pass
+
+    job_def = interval_etl.to_job_definition()
+    assert job_def["allow_external_schedulers"] is True
+    assert "incremental_mode" not in job_def
+
+    # pipeline mode (also the default) emits neither field
+    @job(incremental_mode="pipeline")
+    def pipeline_etl():
+        pass
+
+    job_def = pipeline_etl.to_job_definition()
+    assert "allow_external_schedulers" not in job_def
+    assert "incremental_mode" not in job_def
+
+    # pipeline_run decorator accepts the same arg
+    @pipeline_run("my_pipeline", incremental_mode="interval")
+    def run_pipeline():
+        pass
+
+    job_def = run_pipeline.to_job_definition()
+    assert job_def["allow_external_schedulers"] is True
+    assert "incremental_mode" not in job_def
+
+
+def test_job_definition_auto_refresh_pipeline_mode() -> None:
+    """`auto_refresh_pipeline_mode` is emitted directly; default emits nothing."""
+
+    @job(auto_refresh_pipeline_mode="drop_sources")
+    def refreshing():
+        pass
+
+    assert refreshing.to_job_definition()["auto_refresh_pipeline_mode"] == "drop_sources"
+
+    @job
+    def plain():
+        pass
+
+    assert "auto_refresh_pipeline_mode" not in plain.to_job_definition()
+
+    @pipeline_run("analytics", auto_refresh_pipeline_mode="drop_data")
+    def run_pipeline():
+        pass
+
+    assert run_pipeline.to_job_definition()["auto_refresh_pipeline_mode"] == "drop_data"
+
+
 def test_job_definition_interactive() -> None:
     """to_job_definition produces correct TJobDefinition for interactive jobs."""
 
@@ -609,36 +661,38 @@ def test_pipeline_run_with_expose_override() -> None:
     assert job_def["expose"]["tags"] == ["daily"]
 
 
-def test_job_refresh_default_auto_omitted_from_manifest() -> None:
-    """Default `refresh="auto"` is not written to the manifest dict."""
+def test_job_refresh_propagation_default_auto_omitted_from_manifest() -> None:
+    """Default `refresh_propagation="auto"` is not written to the manifest dict."""
 
     @job
     def default_job():
         pass
 
-    assert default_job.refresh == "auto"
+    assert default_job.refresh_propagation == "auto"
     job_def = default_job.to_job_definition()
     assert "refresh" not in job_def
+    assert "refresh_propagation" not in job_def
 
 
 @pytest.mark.parametrize("policy", ["always", "block"])
-def test_job_refresh_non_default_written_to_manifest(policy: str) -> None:
-    """Non-default refresh values are written to the manifest dict."""
+def test_job_refresh_propagation_non_default_written_to_manifest(policy: str) -> None:
+    """Non-default values serialize as the backward-compatible `refresh` field."""
     refresh_policy = cast(Literal["always", "auto", "block"], policy)
 
-    @job(refresh=refresh_policy)
+    @job(refresh_propagation=refresh_policy)
     def explicit_job():
         pass
 
-    assert explicit_job.refresh == policy
+    assert explicit_job.refresh_propagation == policy
     job_def = explicit_job.to_job_definition()
     assert job_def["refresh"] == policy
+    assert "refresh_propagation" not in job_def
 
 
-def test_job_refresh_explicit_auto_omitted() -> None:
-    """Explicitly passing `refresh="auto"` still results in no manifest field."""
+def test_job_refresh_propagation_explicit_auto_omitted() -> None:
+    """Explicitly passing `refresh_propagation="auto"` still results in no manifest field."""
 
-    @job(refresh="auto")
+    @job(refresh_propagation="auto")
     def explicit_auto():
         pass
 
@@ -646,14 +700,14 @@ def test_job_refresh_explicit_auto_omitted() -> None:
     assert "refresh" not in job_def
 
 
-def test_pipeline_run_refresh() -> None:
+def test_pipeline_run_refresh_propagation() -> None:
     """`pipeline_run` accepts and propagates the refresh policy."""
 
-    @pipeline_run("analytics", refresh="always")
+    @pipeline_run("analytics", refresh_propagation="always")
     def loader():
         pass
 
-    assert loader.refresh == "always"
+    assert loader.refresh_propagation == "always"
     job_def = loader.to_job_definition()
     assert job_def["refresh"] == "always"
 

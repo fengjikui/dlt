@@ -23,6 +23,8 @@ from dlt._workspace.deployment.typing import (
     TJobRef,
     TRuntimeEntryPoint,
     TTrigger,
+    resolve_incremental_mode,
+    resolve_refresh_propagation,
 )
 from dlt._workspace.deployment.interval import (
     check_all_upstream_run_fresh,
@@ -160,16 +162,15 @@ def _eager_refresh_cascade(
         explicit `--refresh` flag).
       - Otherwise clear `prev_completed_run` for the target and the
         result of `get_refresh_cascade_targets` (which walks the
-        freshness graph stopping at `block` and excluding
-        interval-store-eligible jobs).
+        freshness graph stopping at `block`).
     """
     cleared: Set[str] = set()
     for job_def, _trigger in targets:
         if _is_interval_job(job_def):
             continue
         job_ref = job_def["job_ref"]
-        if job_def.get("refresh") == "block":
-            warn(f"{_short(job_ref)}: --refresh ignored (refresh=block)")
+        if resolve_refresh_propagation(job_def) == "block":
+            warn(f"{_short(job_ref)}: --refresh ignored (refresh_propagation=block)")
             continue
         ok, reasons = _can_dispatch_now(job_def)
         if not ok:
@@ -226,7 +227,8 @@ def _handle_signal(signum: int, frame: object) -> None:
 
 
 def _is_interval_job(job_def: TJobDefinition) -> bool:
-    return "interval" in job_def and job_def.get("allow_external_schedulers", False)
+    interval = job_def.get("interval")
+    return interval is not None and interval.get("mode") == "parallel"
 
 
 def _try_start_interval_job(
@@ -381,7 +383,7 @@ def _start_job(
     # a refresh run is determined by the current `prev_completed_run`
     # value (cleared earlier by an explicit `--refresh` or by an
     # upstream cascade if applicable).
-    if not _is_interval_job(job_def) and job_def.get("refresh") == "always":
+    if not _is_interval_job(job_def) and resolve_refresh_propagation(job_def) == "always":
         for ds_ref in get_refresh_cascade_targets(job_ref, _all_jobs_map):
             _freshness_store.clear_prev_completed_run(ds_ref)
 
@@ -417,12 +419,18 @@ def _start_job(
         entry_point["interval_start"] = eff_interval[0].isoformat()
         entry_point["interval_end"] = eff_interval[1].isoformat()
 
-    # propagate allow_external_schedulers and timezone to launcher (only meaningful
+    # propagate incremental mode and timezone to launcher (only meaningful
     # when an interval is provided). timezone is re-applied at the launcher boundary
     # so the user-facing interval carries its IANA identity across JSON round-trip.
     if "interval_start" in entry_point:
-        entry_point["allow_external_schedulers"] = job_def.get("allow_external_schedulers", False)
+        mode = resolve_incremental_mode(job_def)
+        if job_def.get("incremental_mode") is not None:
+            entry_point["incremental_mode"] = mode
+        entry_point["allow_external_schedulers"] = mode == "interval"
         entry_point["interval_timezone"] = job_def.get("require", {}).get("timezone", "UTC")
+
+    if job_def.get("auto_refresh_pipeline_mode"):
+        entry_point["auto_refresh_pipeline_mode"] = job_def["auto_refresh_pipeline_mode"]
 
     # pass profile from require spec
     require = job_def.get("require", {})
@@ -515,7 +523,7 @@ def _collect_completions(
             if run_id:
                 run_record = _runs_store.get_run(run_id)
                 if run_record and "interval_start" in run_record:
-                    iv = (run_record["interval_start"], run_record["interval_end"])
+                    iv = TTimeInterval(run_record["interval_start"], run_record["interval_end"])
 
             finished_at = pendulum.now("UTC")
             run_status: TJobRunStatus = "completed" if exit_code == 0 else "failed"

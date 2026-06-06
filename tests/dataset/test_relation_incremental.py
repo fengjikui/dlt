@@ -574,6 +574,77 @@ def test_incremental_condition_typed_literal_for_non_timestamp_types(
     assert expected_cast in cond.sql(dialect="duckdb")
 
 
+@pytest.mark.parametrize(
+    ("column_dlt_type", "column_tz", "bound_value", "expected_literal"),
+    [
+        # column = timestamp(tz)
+        pytest.param(
+            "timestamp",
+            True,
+            pendulum.datetime(2026, 4, 1, tz="UTC"),
+            "CAST('2026-04-01 00:00:00.000000+00:00' AS TIMESTAMPTZ)",
+            id="ts-from-datetime",
+        ),
+        pytest.param(
+            "timestamp",
+            True,
+            pendulum.date(2026, 4, 1),
+            "CAST('2026-04-01 00:00:00.000000+00:00' AS TIMESTAMPTZ)",
+            id="ts-from-date",
+        ),
+        pytest.param(
+            "timestamp",
+            True,
+            "2026-04-01T00:00:00+00:00",
+            "CAST('2026-04-01 00:00:00.000000+00:00' AS TIMESTAMPTZ)",
+            id="ts-from-iso",
+        ),
+        # column = date
+        pytest.param(
+            "date",
+            None,
+            pendulum.datetime(2026, 4, 1, tz="UTC"),
+            "CAST('2026-04-01' AS DATE)",
+            id="date-from-datetime",
+        ),
+        pytest.param(
+            "date",
+            None,
+            pendulum.date(2026, 4, 1),
+            "CAST('2026-04-01' AS DATE)",
+            id="date-from-date",
+        ),
+        pytest.param(
+            "date",
+            None,
+            "2026-04-01",
+            "CAST('2026-04-01' AS DATE)",
+            id="date-from-iso",
+        ),
+    ],
+)
+def test_incremental_condition_temporal_coercion(
+    column_dlt_type: str,
+    column_tz: Optional[bool],
+    bound_value: Any,
+    expected_literal: str,
+) -> None:
+    """Cursor bounds are coerced to the column's temporal type before literal emission."""
+    incr = dlt.sources.incremental(
+        "cur", initial_value=bound_value, on_cursor_value_missing="exclude"
+    )
+    column_ref = sge.Column(this=sge.to_identifier("cur", quoted=True))
+    if column_dlt_type == "timestamp":
+        sqlglot_type = to_sqlglot_type(
+            dlt_type="timestamp", precision=6, timezone=column_tz, nullable=True
+        )
+    else:
+        sqlglot_type = to_sqlglot_type(dlt_type="date", nullable=True)
+    cond = _build_incremental_condition(incr, column_ref, sqlglot_type)
+    assert cond is not None
+    assert expected_literal in cond.sql(dialect="duckdb")
+
+
 def test_incremental_condition_untyped_literals_when_sqlglot_type_unknown() -> None:
     incr: dlt.sources.incremental[int] = dlt.sources.incremental(
         "created_at", initial_value=10, end_value=50, on_cursor_value_missing="exclude"
@@ -589,16 +660,13 @@ def test_incremental_condition_untyped_literals_when_sqlglot_type_unknown() -> N
 
 def _build_agg_sql(*, caps: Optional[DestinationCapabilitiesContext], dialect: str) -> str:
     incr = dlt.sources.incremental[int]("id", initial_value=0, range_start="open")
-    ctx = _RelationIncrementalContext(
-        incremental=incr,
-        cursor_column=sge.Column(this=sge.to_identifier("id", quoted=True)),
-    )
+    cursor_column = sge.Column(this=sge.to_identifier("id", quoted=True))
     base = sge.Select(expressions=[sge.Column(this=sge.to_identifier("id", quoted=True))]).from_(
         sge.Table(this=sge.to_identifier("t", quoted=True))
     )
-    return _build_incremental_aggregate(base, ctx, destination_capabilities=caps).sql(
-        dialect=dialect
-    )
+    return _build_incremental_aggregate(
+        base, incr, cursor_column, destination_capabilities=caps
+    ).sql(dialect=dialect)
 
 
 def test_incremental_aggregate_uses_plain_max_when_caps_lack_null_safe_wrapper() -> None:
@@ -737,13 +805,19 @@ def test_incremental_dotted_cursor_on_query_relation_raises(
         query_relation.incremental(incremental)
 
 
-def test_incremental_chained_call_raises(incremental_dataset: dlt.Dataset) -> None:
+def test_incremental_chained_call_composes_wheres(incremental_dataset: dlt.Dataset) -> None:
+    """Repeated `.incremental()` calls AND their WHERE clauses and the latest ctx wins."""
     incremental_a = dlt.sources.incremental("id", initial_value=1, end_value=END_VALUE_ID)
     incremental_b = dlt.sources.incremental("value", initial_value=0.0, end_value=10.0)
 
-    relation = incremental_dataset.table("events").incremental(incremental_a)
-    with pytest.raises(ValueError, match="already been applied"):
-        relation.incremental(incremental_b)
+    relation = (
+        incremental_dataset.table("events").incremental(incremental_a).incremental(incremental_b)
+    )
+    sql = relation.to_sql()
+    assert '"id" >= CAST(1 AS BIGINT)' in sql
+    assert '"value" >= CAST(0.0 AS DOUBLE)' in sql
+    # latest applied ctx is the one tracked
+    assert relation._incremental_ctx.incremental is incremental_b
 
 
 @pytest.mark.parametrize(

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Type, TYPE_CHECKING
+from typing import Any, Callable, Optional, Tuple, Type, TYPE_CHECKING
 
 import sqlglot.expressions as sge
 from jsonpath_ng.exceptions import JSONPathError
 
+from dlt.common import logger
 from dlt.common.jsonpath import extract_simple_field_name
 from dlt.common.libs.sqlglot import (
     SQLGLOT_TO_DLT_TYPE_MAP,
@@ -34,11 +35,12 @@ class _RelationIncrementalContext:
 
 def _build_incremental_aggregate(
     base_query: sge.Query,
-    ctx: _RelationIncrementalContext,
+    incremental: Incremental[Any],
+    cursor_column: sge.Column,
     destination_capabilities: Optional[DestinationCapabilitiesContext] = None,
 ) -> sge.Select:
     """Build `SELECT <func>(alias) FROM (SELECT cursor AS alias FROM <filtered>)`."""
-    if ctx.incremental.end_value is None and base_query.args.get("limit") is not None:
+    if incremental.end_value is None and base_query.args.get("limit") is not None:
         raise ValueError(
             "LIMIT isn't supported on stateful `.incremental()` as state would "
             "advance past only the returned rows, silently skipping the rest on "
@@ -46,29 +48,29 @@ def _build_incremental_aggregate(
         )
 
     cursor_alias = sge.to_identifier(_AGG_CURSOR_ALIAS, quoted=True)
-    if ctx.cursor_column.table:
+    if cursor_column.table:
         # qualified cursor (auto-join): replace projection inline so the join qualifier resolves
         inner = base_query.copy()
         inner.set(
             "expressions",
-            [sge.Alias(this=ctx.cursor_column.copy(), alias=cursor_alias)],
+            [sge.Alias(this=cursor_column.copy(), alias=cursor_alias)],
         )
     else:
         # bare cursor: wrap base as subquery so GROUP BY, HAVING, and aliased computed cursors are preserved
-        bare_cursor = sge.Column(this=ctx.cursor_column.this.copy())
+        bare_cursor = sge.Column(this=cursor_column.this.copy())
         inner = sge.Select(expressions=[sge.Alias(this=bare_cursor, alias=cursor_alias)]).from_(
             base_query.copy().subquery()
         )
 
     agg_cls: Type[sge.AggFunc]
-    if ctx.incremental.last_value_func is max:
+    if incremental.last_value_func is max:
         agg_cls = sge.Max
-    elif ctx.incremental.last_value_func is min:
+    elif incremental.last_value_func is min:
         agg_cls = sge.Min
     else:
         raise ValueError(
             "Incremental aggregate can only be built for `min` or `max` "
-            f"`last_value_func`, got {ctx.incremental.last_value_func!r}."
+            f"`last_value_func`, got {incremental.last_value_func!r}."
         )
 
     outer_ref = sge.Column(this=cursor_alias.copy())
@@ -159,10 +161,7 @@ def _build_incremental_condition(
             f"{on_missing!r}` is not supported by "
             "`Relation.incremental()`. Expected one of: 'include', 'exclude', 'raise'."
         )
-    # XXX: Discard the upper here: when the cursor is bound and end_value isn't set,
-    # resolve_bounds substitutes state["last_value"] as the upper.
-    start_value, _ = incremental.resolve_bounds(apply_lag=True)
-    end_value = incremental.end_value
+    start_value, end_value = incremental.resolve_bounds(apply_lag=True)
 
     # caps-aware timestamp formatting
     if sqlglot_type is not None and SQLGLOT_TO_DLT_TYPE_MAP.get(sqlglot_type.this) == "timestamp":
@@ -194,6 +193,69 @@ def _build_incremental_condition(
     return sge.And(this=bounds, expression=is_not_null)
 
 
+def _apply_incremental(
+    *,
+    incremental: Incremental[Any],
+    target_query: sge.Query,
+    column_ref: sge.Column,
+    column_lookup_columns: TTableSchemaColumns,
+    destination_capabilities: Optional[DestinationCapabilitiesContext] = None,
+    advance: bool = False,
+    fetch_aggregate_scalar: Optional[Callable[[sge.Query], Any]] = None,
+) -> Tuple[sge.Query, _RelationIncrementalContext]:
+    """Attach incremental WHERE to `target_query`; with `advance=True`, advance state."""
+    column_name = column_ref.name
+    sqlglot_type = _sqlglot_type_for_column(column_lookup_columns, column_name)
+    _maybe_warn_on_cursor_missing_raise(incremental, column_lookup_columns, column_name)
+
+    if advance:
+        if incremental.end_value is not None:
+            new_value = incremental.end_value
+        else:
+            if fetch_aggregate_scalar is None:
+                raise ValueError(
+                    "`fetch_aggregate_scalar` is required when `advance=True` and"
+                    " `incremental.end_value` is unset."
+                )
+            lower_condition = _build_incremental_condition(
+                incremental,
+                column_ref,
+                sqlglot_type,
+                destination_capabilities=destination_capabilities,
+            )
+            filtered_query = (
+                target_query.where(lower_condition) if lower_condition is not None else target_query
+            )
+            agg_query = _build_incremental_aggregate(
+                filtered_query,
+                incremental,
+                column_ref,
+                destination_capabilities=destination_capabilities,
+            )
+            new_value = fetch_aggregate_scalar(agg_query)
+            if new_value is not None and (
+                incremental.range_end == "open"
+                and incremental.initial_value == incremental.start_value
+            ):
+                logger.warning(
+                    f"Boundary value {new_value} on cursor column"
+                    f" {incremental.cursor_path!r} will not be included in this"
+                    " run. SQL incremental does not support boundary"
+                    " deduplication, so the boundary row is deferred until state"
+                    " advances past it. To load it eagerly, set range_end='closed'"
+                    " and use write_disposition='merge' with a primary_key to"
+                    " dedup the overlap."
+                )
+        incremental.advance(new_value)
+
+    condition = _build_incremental_condition(
+        incremental, column_ref, sqlglot_type, destination_capabilities=destination_capabilities
+    )
+    final_query = target_query.where(condition) if condition is not None else target_query
+    ctx = _RelationIncrementalContext(incremental=incremental, cursor_column=column_ref.copy())
+    return final_query, ctx
+
+
 def _raise_incomplete_cursor_column(cursor_path: str, location_label: str) -> None:
     raise ValueError(
         f"Incremental cursor `{cursor_path}` is not a materialized column on "
@@ -218,7 +280,7 @@ def _maybe_warn_on_cursor_missing_raise(
         "cursors will be excluded. Set on_cursor_value_missing explicitly "
         "to silence.",
         UserWarning,
-        stacklevel=4,
+        stacklevel=5,
     )
 
 

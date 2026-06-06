@@ -32,6 +32,7 @@ from dlt._workspace.deployment.launchers import LAUNCHER_JOB, LAUNCHER_MODULE
 from dlt._workspace.deployment.typing import (
     TEntryPoint,
     TExecuteSpec,
+    TIncrementalMode,
     TIntervalSpec,
     TJobDefinition,
     TJobRef,
@@ -54,8 +55,10 @@ def _job(
     job_type: str = "batch",
     function: Optional[str] = "main",
     refresh: Optional[TRefreshPolicy] = None,
+    refresh_propagation: Optional[TRefreshPolicy] = None,
     require: Optional[TRequireSpec] = None,
     interval: Optional[TIntervalSpec] = None,
+    incremental_mode: Optional[TIncrementalMode] = None,
     allow_external_schedulers: bool = False,
     launcher: Optional[str] = None,
 ) -> TJobDefinition:
@@ -77,10 +80,14 @@ def _job(
         jd["default_trigger"] = TTrigger(default_trigger)
     if refresh is not None:
         jd["refresh"] = refresh
+    if refresh_propagation is not None:
+        jd["refresh_propagation"] = refresh_propagation
     if require is not None:
         jd["require"] = require
     if interval is not None:
         jd["interval"] = interval
+    if incremental_mode is not None:
+        jd["incremental_mode"] = incremental_mode
     if allow_external_schedulers:
         jd["allow_external_schedulers"] = True
     return jd
@@ -335,13 +342,26 @@ def test_resolve_refresh(
     expected_refresh: bool,
     expect_warning: bool,
 ) -> None:
+    # legacy `refresh` field
     jd = _job("jobs.a", refresh=policy)
     effective, warning = resolve_refresh(user_flag, jd)
     assert effective is expected_refresh
     if expect_warning:
-        assert warning and "refresh=block" in warning
+        assert warning and "refresh_propagation=block" in warning
     else:
         assert warning is None
+    # `refresh_propagation` field resolves identically
+    jd = _job("jobs.a", refresh_propagation=policy)
+    effective, _ = resolve_refresh(user_flag, jd)
+    assert effective is expected_refresh
+
+
+def test_resolve_refresh_propagation_precedence() -> None:
+    """`refresh_propagation` wins over a stale legacy `refresh` field."""
+    jd = _job("jobs.a", refresh="block", refresh_propagation="auto")
+    effective, warning = resolve_refresh(True, jd)
+    assert effective is True
+    assert warning is None
 
 
 @pytest.mark.parametrize(
@@ -565,10 +585,36 @@ def test_build_runtime_entry_point_config_merges() -> None:
     assert ep["config"] == {"A": "1", "B": "override", "C": "3"}
 
 
-def test_build_runtime_entry_point_propagates_allow_external_schedulers() -> None:
-    jd = _job("jobs.a", allow_external_schedulers=True)
+@pytest.mark.parametrize(
+    "jd_kwargs,expected_allow,expected_mode",
+    [
+        ({"allow_external_schedulers": True}, True, None),
+        ({"incremental_mode": "interval"}, True, "interval"),
+        ({"incremental_mode": "pipeline"}, False, "pipeline"),
+        ({"incremental_mode": "pipeline", "allow_external_schedulers": True}, False, "pipeline"),
+    ],
+    ids=["legacy-flag", "mode-interval", "mode-pipeline", "mode-wins-over-stale-flag"],
+)
+def test_build_runtime_entry_point_propagates_incremental_mode(
+    jd_kwargs: Dict[str, Any],
+    expected_allow: bool,
+    expected_mode: Optional[str],
+) -> None:
+    """Mode propagates to entry point; the compat flag is always derived from it."""
+    jd = _job("jobs.a", **jd_kwargs)
     ep = build_runtime_entry_point(jd, {}, "dev", False, NOW, NOW, "UTC")
-    assert ep["allow_external_schedulers"] is True
+    assert ep["allow_external_schedulers"] is expected_allow
+    assert ep.get("incremental_mode") == expected_mode
+
+
+def test_build_runtime_entry_point_propagates_auto_refresh_pipeline_mode() -> None:
+    jd = _job("jobs.a")
+    ep = build_runtime_entry_point(jd, {}, "dev", False, NOW, NOW, "UTC")
+    assert "auto_refresh_pipeline_mode" not in ep
+
+    jd["auto_refresh_pipeline_mode"] = "drop_sources"
+    ep = build_runtime_entry_point(jd, {}, "dev", True, NOW, NOW, "UTC")
+    assert ep["auto_refresh_pipeline_mode"] == "drop_sources"
 
 
 def test_build_runtime_entry_point_does_not_mutate_job_def() -> None:

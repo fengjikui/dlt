@@ -58,7 +58,6 @@ from dlt.common.versioned_state import TVersionedState
 from dlt.common.runtime.collector_base import Collector
 
 
-# TRefreshMode = Literal["full", "replace"]
 TRefreshMode = Literal["drop_sources", "drop_resources", "drop_data"]
 
 

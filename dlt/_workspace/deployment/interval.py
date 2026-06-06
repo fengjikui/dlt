@@ -1,7 +1,7 @@
 """Interval computation and run-based upstream freshness checks."""
 
 from datetime import datetime, timedelta, timezone  # noqa: I251
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 from dlt import version
@@ -11,6 +11,7 @@ from dlt.common.typing import TTimeInterval
 
 from dlt._workspace.deployment._trigger_helpers import (
     maybe_parse_schedule,
+    normalize_trigger,
     parse_trigger,
 )
 from dlt._workspace.deployment.freshness import parse_freshness_constraint
@@ -145,22 +146,22 @@ def compute_run_interval(
             if prev_interval_end is not None
             else natural_start
         )
-        return (start_utc, end_utc)
+        return TTimeInterval(start_utc, end_utc)
 
     if tt == "every":
         period = float(parsed.expr)  # type: ignore[arg-type]
         # continuity: prev_interval_end extends start backward; else [now-period, now)
         if prev_interval_end is not None:
-            return (ensure_datetime_utc(prev_interval_end), now_p)
-        return (now_p - timedelta(seconds=period), now_p)
+            return TTimeInterval(ensure_datetime_utc(prev_interval_end), now_p)
+        return TTimeInterval(now_p - timedelta(seconds=period), now_p)
 
     if tt == "once":
         # point-in-time: prev_interval_end ignored by design
         once_dt = ensure_datetime_utc(parsed.expr)  # type: ignore[arg-type]
-        return (once_dt, once_dt)
+        return TTimeInterval(once_dt, once_dt)
 
     # all remaining trigger types: point-in-time at now (prev_interval_end ignored)
-    return (now_p, now_p)
+    return TTimeInterval(now_p, now_p)
 
 
 def resolve_interval_spec(spec: TIntervalSpec, cron_expr: str, tz: str = "UTC") -> TTimeInterval:
@@ -179,7 +180,7 @@ def resolve_interval_spec(spec: TIntervalSpec, cron_expr: str, tz: str = "UTC") 
     raw_end = ensure_datetime_in_tz(end_str, target_tz) if end_str else datetime.now(target_tz)
     end = cron_floor(cron_expr, raw_end)
 
-    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    return TTimeInterval(start.astimezone(timezone.utc), end.astimezone(timezone.utc))
 
 
 def cron_floor(cron_expr: str, dt: datetime) -> datetime:
@@ -199,6 +200,64 @@ def cron_floor(cron_expr: str, dt: datetime) -> datetime:
     if dt.tzinfo is not None:
         return prev_naive.replace(tzinfo=dt.tzinfo)
     return prev_naive
+
+
+def cron_lag(cron_expr: str, dt: datetime, count: int) -> datetime:
+    """Floor `dt` to the latest cron tick, then step `count` ticks into the past.
+
+    `count=0` returns the floor tick (`dt` itself when it falls on a tick).
+    Negative `count` steps into the future: `count=-1` is the first tick strictly
+    after the floor. Preserves `dt`'s timezone using the same wall-clock
+    iteration as `cron_floor`.
+    """
+    base = (dt.replace(tzinfo=None) if dt.tzinfo else dt) + timedelta(microseconds=1)
+    cron = croniter(cron_expr, base)
+    tick: datetime = cron.get_prev(datetime)
+    for _ in range(abs(count)):
+        tick = cron.get_prev(datetime) if count > 0 else cron.get_next(datetime)
+    if dt.tzinfo is not None:
+        return tick.replace(tzinfo=dt.tzinfo)
+    return tick
+
+
+def lag_interval(
+    interval: TTimeInterval, trigger: Union[str, TTrigger], count: int = 1, lag_end: bool = False
+) -> TTimeInterval:
+    """Lag interval start (or end with `lag_end`) by `count` trigger ticks into the past.
+
+    `count=0` snaps the bound to the tick floor, negative `count` moves it into
+    the future. For `every:` triggers the bound shifts by `period * count`.
+
+    Args:
+        interval: The interval to adjust.
+        trigger: A `schedule:` or `every:` trigger, or a bare cron expression.
+        count: Number of ticks (or periods) to lag, negative moves into the future.
+        lag_end: When `True`, adjusts the end instead of the start.
+
+    Raises:
+        ValueError: If the adjusted interval is empty or negative.
+        InvalidTrigger: If the trigger has no time period.
+    """
+    parsed = parse_trigger(normalize_trigger(trigger))
+    bound = interval.end if lag_end else interval.start
+    if parsed.type == "schedule":
+        bound = cron_lag(str(parsed.expr), bound, count)
+    elif parsed.type == "every":
+        period = float(parsed.expr)  # type: ignore[arg-type]
+        bound = bound - timedelta(seconds=period * count)
+    else:
+        raise InvalidTrigger(str(trigger), "trigger has no time period, use schedule: or every:")
+    start, end = (interval.start, bound) if lag_end else (bound, interval.end)
+    if start >= end:
+        raise ValueError(f"interval [{start}, {end}) is empty or negative after lag")
+    return TTimeInterval(start, end)
+
+
+def full_days_interval(interval: TTimeInterval) -> TTimeInterval:
+    """Widen interval to full days: start floored to midnight, end extended to the
+    next midnight. Each bound is adjusted in its own timezone."""
+    daily = "0 0 * * *"
+    return TTimeInterval(cron_lag(daily, interval.start, 0), cron_lag(daily, interval.end, -1))
 
 
 def is_cron_expression(s: str) -> bool:

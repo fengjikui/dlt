@@ -51,6 +51,8 @@ from dlt._workspace.deployment.typing import (
     TJobsDeploymentManifest,
     TRuntimeEntryPoint,
     TTrigger,
+    resolve_incremental_mode,
+    resolve_refresh_propagation,
 )
 
 
@@ -229,14 +231,15 @@ def warn_missing_profiles() -> List[str]:
 
 def resolve_refresh(user_refresh: bool, job_def: TJobDefinition) -> Tuple[bool, Optional[str]]:
     """Apply a job's `TRefreshPolicy` to `user_refresh`. Returns `(effective, warning_or_None)`."""
-    policy = job_def.get("refresh", "auto")
+    policy = resolve_refresh_propagation(job_def)
     if policy == "always":
         return True, None
     if policy == "block":
         warning: Optional[str] = None
         if user_refresh:
             warning = (
-                f"--refresh ignored: job {short_name(job_def['job_ref'])!r} declares refresh=block"
+                f"--refresh ignored: job {short_name(job_def['job_ref'])!r} declares"
+                " refresh_propagation=block"
             )
         return False, warning
     return user_refresh, None
@@ -329,7 +332,13 @@ def build_runtime_entry_point(
     entry_point["interval_start"] = interval_start.isoformat()
     entry_point["interval_end"] = interval_end.isoformat()
     entry_point["interval_timezone"] = tz
-    entry_point["allow_external_schedulers"] = job_def.get("allow_external_schedulers", False)
+    # pass mode explicitly when set, keep deprecated flag for old launchers and backends
+    mode = resolve_incremental_mode(job_def)
+    if job_def.get("incremental_mode") is not None:
+        entry_point["incremental_mode"] = mode
+    entry_point["allow_external_schedulers"] = mode == "interval"
+    if job_def.get("auto_refresh_pipeline_mode"):
+        entry_point["auto_refresh_pipeline_mode"] = job_def["auto_refresh_pipeline_mode"]
     entry_point["profile"] = profile
     entry_point["refresh"] = refresh
     execute_spec = job_def.get("execute") or {}

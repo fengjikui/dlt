@@ -6,7 +6,7 @@ from typing_extensions import TypeVar
 
 from dlt.common.configuration import get_fun_spec, with_config
 from dlt.common.configuration.specs.base_configuration import BaseConfiguration
-from dlt.common.pipeline import SupportsPipeline
+from dlt.common.pipeline import SupportsPipeline, TRefreshMode
 from dlt.common.reflection.inspect import iscoroutinefunction
 from dlt.common.typing import AnyFun, Generic, ParamSpec
 from dlt.common.utils import get_callable_name, get_module_name
@@ -32,6 +32,7 @@ from dlt._workspace.deployment.typing import (
     TExecuteSpec,
     TExposeSpec,
     TFreshnessConstraint,
+    TIncrementalMode,
     TInterfaceType,
     TIntervalSpec,
     TJobDefinition,
@@ -125,8 +126,9 @@ class JobFactory(Generic[TJobFunParams, TJobResult]):
         self.deliver: Optional[TDeliverTarget] = None
         self.interval: Optional[TIntervalSpec] = None
         self.freshness: List[TFreshnessConstraint] = []
-        self.allow_external_schedulers: bool = False
-        self.refresh: TRefreshPolicy = "auto"
+        self.incremental_mode: TIncrementalMode = "pipeline"
+        self.refresh_propagation: TRefreshPolicy = "auto"
+        self.auto_refresh_pipeline_mode: Optional[TRefreshMode] = None
 
     @property
     def job_ref(self) -> TJobRef:
@@ -224,10 +226,14 @@ class JobFactory(Generic[TJobFunParams, TJobResult]):
             job_def["interval"] = self.interval
         if self.freshness:
             job_def["freshness"] = list(self.freshness)
-        if self.allow_external_schedulers:
+        # serialize as the backward-compatible flag, `incremental_mode` is not emitted yet
+        if self.incremental_mode == "interval":
             job_def["allow_external_schedulers"] = True
-        if self.refresh != "auto":
-            job_def["refresh"] = self.refresh
+        # serialize as the backward-compatible field, `refresh_propagation` is not emitted yet
+        if self.refresh_propagation != "auto":
+            job_def["refresh"] = self.refresh_propagation
+        if self.auto_refresh_pipeline_mode:
+            job_def["auto_refresh_pipeline_mode"] = self.auto_refresh_pipeline_mode
 
         if self.deliver is not None:
             if isinstance(self.deliver, dict):
@@ -256,8 +262,9 @@ def _job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    allow_external_schedulers: bool = False,
-    refresh: TRefreshPolicy = "auto",
+    incremental_mode: TIncrementalMode = "pipeline",
+    refresh_propagation: TRefreshPolicy = "auto",
+    auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
 ) -> Any:
     """Common decorator implementation for all job types."""
@@ -280,8 +287,9 @@ def _job(
     wrapper.deliver = deliver
     wrapper.interval = interval
     wrapper.freshness = normalize_freshness_constraints(freshness)
-    wrapper.allow_external_schedulers = allow_external_schedulers
-    wrapper.refresh = refresh
+    wrapper.incremental_mode = incremental_mode
+    wrapper.refresh_propagation = refresh_propagation
+    wrapper.auto_refresh_pipeline_mode = auto_refresh_pipeline_mode
     wrapper._user_spec = spec
 
     if func is None:
@@ -304,8 +312,9 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    allow_external_schedulers: bool = False,
-    refresh: TRefreshPolicy = "auto",
+    incremental_mode: TIncrementalMode = "pipeline",
+    refresh_propagation: TRefreshPolicy = "auto",
+    auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
 ) -> JobFactory[TJobFunParams, TJobResult]: ...
 
@@ -325,8 +334,9 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    allow_external_schedulers: bool = False,
-    refresh: TRefreshPolicy = "auto",
+    incremental_mode: TIncrementalMode = "pipeline",
+    refresh_propagation: TRefreshPolicy = "auto",
+    auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
 ) -> Callable[[Callable[TJobFunParams, TJobResult]], JobFactory[TJobFunParams, TJobResult]]: ...
 
@@ -345,8 +355,9 @@ def job(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    allow_external_schedulers: bool = False,
-    refresh: TRefreshPolicy = "auto",
+    incremental_mode: TIncrementalMode = "pipeline",
+    refresh_propagation: TRefreshPolicy = "auto",
+    auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
 ) -> Any:
     """Marks a function as a deployable batch job.
@@ -382,13 +393,19 @@ def job(
         freshness: Upstream freshness constraints. Accepts a single constraint
             string, `TFreshnessConstraint`, or a list of them.
 
-        allow_external_schedulers: When `True`, intervals and state are managed
-            by the scheduler rather than the job itself.
+        incremental_mode: How incrementals obtain their range during a run.
+            `interval` - incrementals assume the interval of the job, state is
+            managed by the scheduler. `pipeline` (default) - incrementals keep
+            their own state in the pipeline.
 
-        refresh: Refresh-signal propagation policy. `auto` (default) passes
+        refresh_propagation: Refresh-signal propagation policy. `auto` (default) passes
             through if this run had `refresh=True`. `always` always clears
             direct downstream `prev_completed_run` on success. `block` never
             propagates. Ignored for interval-store jobs.
+
+        auto_refresh_pipeline_mode: When a refresh run is requested, applies this
+            refresh mode to every pipeline created in the job via `pipelines.refresh`
+            configuration. Explicit `refresh` arguments on `dlt.pipeline()` still win.
 
         spec: Optional configuration spec class.
 
@@ -407,8 +424,9 @@ def job(
         deliver=deliver,
         interval=interval,
         freshness=freshness,
-        allow_external_schedulers=allow_external_schedulers,
-        refresh=refresh,
+        incremental_mode=incremental_mode,
+        refresh_propagation=refresh_propagation,
+        auto_refresh_pipeline_mode=auto_refresh_pipeline_mode,
         spec=spec,
     )
 
@@ -516,8 +534,9 @@ def pipeline_run(
     freshness: Union[
         None, str, TFreshnessConstraint, Sequence[Union[str, TFreshnessConstraint]]
     ] = None,
-    allow_external_schedulers: bool = False,
-    refresh: TRefreshPolicy = "auto",
+    incremental_mode: TIncrementalMode = "pipeline",
+    refresh_propagation: TRefreshPolicy = "auto",
+    auto_refresh_pipeline_mode: Optional[TRefreshMode] = None,
     spec: Type[BaseConfiguration] = None,
 ) -> Callable[[Callable[TJobFunParams, TJobResult]], JobFactory[TJobFunParams, TJobResult]]:
     """Creates a job bound to a specific pipeline.
@@ -546,12 +565,19 @@ def pipeline_run(
 
         freshness: Upstream freshness constraints.
 
-        allow_external_schedulers: When `True`, intervals managed by scheduler.
+        incremental_mode: How incrementals obtain their range during a run.
+            `interval` - incrementals assume the interval of the job, state is
+            managed by the scheduler. `pipeline` (default) - incrementals keep
+            their own state in the pipeline.
 
-        refresh: Refresh-signal propagation policy. `auto` (default) passes
+        refresh_propagation: Refresh-signal propagation policy. `auto` (default) passes
             through if this run had `refresh=True`. `always` always clears
             direct downstream `prev_completed_run` on success. `block` never
             propagates. Ignored for interval-store jobs.
+
+        auto_refresh_pipeline_mode: When a refresh run is requested, applies this
+            refresh mode to every pipeline created in the job via `pipelines.refresh`
+            configuration. Explicit `refresh` arguments on `dlt.pipeline()` still win.
 
         spec: Optional configuration spec class.
 
@@ -581,8 +607,9 @@ def pipeline_run(
             deliver=deliver,  # type: ignore[arg-type]
             interval=interval,
             freshness=freshness,
-            allow_external_schedulers=allow_external_schedulers,
-            refresh=refresh,
+            incremental_mode=incremental_mode,
+            refresh_propagation=refresh_propagation,
+            auto_refresh_pipeline_mode=auto_refresh_pipeline_mode,
             spec=spec,
         )
 

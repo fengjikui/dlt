@@ -1,4 +1,4 @@
-from datetime import timedelta  # noqa: I251
+from datetime import date, timedelta  # noqa: I251
 from typing import Any, cast, Tuple, List
 import re
 import pytest
