@@ -12,6 +12,7 @@ from dlt.common.jsonpath import extract_simple_field_name
 from dlt.common.libs.sqlglot import (
     SQLGLOT_TO_DLT_TYPE_MAP,
     build_typed_literal,
+    resolve_date_cast,
     resolve_timestamp_cast,
     to_sqlglot_type,
 )
@@ -163,11 +164,14 @@ def _build_incremental_condition(
         )
     start_value, end_value = incremental.resolve_bounds(apply_lag=True)
 
-    # caps-aware timestamp formatting
-    if sqlglot_type is not None and SQLGLOT_TO_DLT_TYPE_MAP.get(sqlglot_type.this) == "timestamp":
+    # coerce temporal bounds to the column type so literals render correctly
+    dlt_type = SQLGLOT_TO_DLT_TYPE_MAP.get(sqlglot_type.this) if sqlglot_type is not None else None
+    if dlt_type == "timestamp":
         sqlglot_type, start_value, end_value = resolve_timestamp_cast(
             start_value, end_value, destination_capabilities
         )
+    elif dlt_type == "date":
+        start_value, end_value = resolve_date_cast(start_value, end_value)
 
     bounds: Optional[sge.Expression] = None
     if start_value is not None:

@@ -216,6 +216,21 @@ def ensure_datetime_in_tz(value: TAnyDateTime, tz: datetime.tzinfo) -> datetime.
     return dt.astimezone(tz)
 
 
+def ensure_date(value: TAnyDateTime) -> datetime.date:
+    """Coerce a date/time value to a stdlib `datetime.date`.
+
+    UTC is assumed if the value is not timezone aware. Other timezones are shifted to UTC
+    before the calendar date is taken.
+
+    Args:
+        value: The value to coerce. Can be a pendulum.DateTime, pendulum.Date, datetime, date or iso date/time str.
+
+    Returns:
+        A stdlib `datetime.date`.
+    """
+    return ensure_datetime_utc(value).date()
+
+
 def ensure_pendulum_datetime_non_utc(value: TAnyDateTime) -> pendulum.DateTime:
     """Coerce a date/time value to a `pendulum.DateTime` object.
 
