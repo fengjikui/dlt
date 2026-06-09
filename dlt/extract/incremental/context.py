@@ -1,7 +1,7 @@
 """Time interval context for external schedulers."""
 
 import os
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Tuple, Union
 from datetime import datetime  # noqa: I251
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,15 @@ from dlt.common.configuration.specs.base_configuration import (
 from dlt.common.configuration.container import Container
 from dlt.common.time import ensure_datetime_utc
 from dlt.common.typing import TTimeInterval
+
+TAnyTimeInterval = Union[TTimeInterval, Tuple[datetime, datetime]]
+"""A `(start, end)` interval as either a `TTimeInterval` or a plain datetime tuple."""
+
+
+def _to_time_interval(interval: Optional[TAnyTimeInterval]) -> Optional[TTimeInterval]:
+    if interval is None or isinstance(interval, TTimeInterval):
+        return interval
+    return TTimeInterval(*interval)
 
 
 @configspec
@@ -26,7 +35,7 @@ class TimeIntervalContext(ContainerInjectableContext):
 
     def __init__(
         self,
-        interval: Optional[TTimeInterval] = None,
+        interval: Optional[TAnyTimeInterval] = None,
         allow_external_schedulers: Optional[bool] = None,
     ) -> None:
         super().__init__()
@@ -34,7 +43,7 @@ class TimeIntervalContext(ContainerInjectableContext):
         # explicit interval is stored; when None, `interval` property auto-detects
         # fresh on every access (so long-lived processes like an Airflow worker
         # running multiple tasks see the current `data_interval_start/end`)
-        self._interval = interval
+        self._interval = _to_time_interval(interval)
 
     @property
     def interval(self) -> Optional[TTimeInterval]:
@@ -46,8 +55,8 @@ class TimeIntervalContext(ContainerInjectableContext):
         return self._detect()
 
     @interval.setter
-    def interval(self, interval: Optional[TTimeInterval]) -> None:
-        self._interval = interval
+    def interval(self, interval: Optional[TAnyTimeInterval]) -> None:
+        self._interval = _to_time_interval(interval)
 
     def _detect(self) -> Optional[TTimeInterval]:
         """Detect interval from environment. Order: dlt env vars -> Airflow -> None.
@@ -97,7 +106,7 @@ class _IntervalAccessor:
         ctx = get_interval_context()
         return ctx.interval if ctx else None
 
-    def set(self, interval: Optional[TTimeInterval]) -> None:  # noqa: A003
+    def set(self, interval: Optional[TAnyTimeInterval]) -> None:  # noqa: A003
         ctx = get_interval_context()
         if ctx is None:
             raise RuntimeError("no TimeIntervalContext active")
