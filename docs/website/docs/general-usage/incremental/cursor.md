@@ -458,12 +458,12 @@ with Container().injectable_context(TimeIntervalContext(interval=(start, end))):
 
 `Incremental` consults the active context automatically - you don't need to wire anything else. Resources without `allow_external_schedulers=True` ignore the context and behave as usual (state-driven incremental).
 
-`TimeIntervalContext` also accepts an `allow_external_schedulers` field that **overrides** the per-incremental setting. Useful when you want a single switch at the runtime layer:
+`TimeIntervalContext` also accepts an `allow_external_schedulers` field. When set to `True`, it enables the join on every incremental that left `allow_external_schedulers` unset — an explicit `True` or `False` on the incremental always wins. Useful when you want a single switch at the runtime layer:
 
 ```py
 ctx = TimeIntervalContext(interval=(start, end), allow_external_schedulers=True)
 with Container().injectable_context(ctx):
-    # joins the context even if individual resources didn't opt in
+    # joins the context for resources that didn't set the flag themselves
     pipeline.run(my_source)
 ```
 

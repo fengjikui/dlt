@@ -374,26 +374,17 @@ class Incremental(
                 # raw start as persisted into state by bind()
                 lower = s.get("start_value")
 
-            if upper is None:
-                # _current_last_value may be none if incremental didn't advance or there were no rows
-                if self._cached_state is not None and self._current_last_value is None:
-                    pass
-                else:
-                    upper = self.last_value
+            # standalone instance (state read via get_state) or advanced value pins the
+            # upper; when bound but not advanced, live row filtering owns the upper
+            if upper is None and (
+                self._cached_state is None or self._current_last_value is not None
+            ):
+                upper = self.last_value
 
         except (IncrementalUnboundError, SourceSectionNotAvailable, PipelineStateNotAvailable):
             # unbound: no state to read from. lag needs a live last_value to step
             # back from — there is none — so it is a no-op here regardless of self.lag
             lower = self.initial_value
-
-        # if self._cached_state is None:
-
-        # elif apply_lag:
-
-        #     lower = self.start_value
-        # else:
-        #     # raw start as persisted into state by bind()
-        #     lower = self._cached_state.get("start_value")
         return lower, upper
 
     def on_resolved(self) -> None:

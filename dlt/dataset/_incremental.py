@@ -7,8 +7,10 @@ from typing import Any, Callable, Optional, Tuple, Type, TYPE_CHECKING
 import sqlglot.expressions as sge
 from jsonpath_ng.exceptions import JSONPathError
 
-from dlt.common import logger
+from dlt.common import json
+from dlt.common.incremental.typing import TIncrementalRange
 from dlt.common.jsonpath import extract_simple_field_name
+from dlt.common.utils import digest128
 from dlt.common.libs.sqlglot import (
     SQLGLOT_TO_DLT_TYPE_MAP,
     build_typed_literal,
@@ -82,37 +84,23 @@ def _build_incremental_aggregate(
     return sge.Select(expressions=[agg]).from_(inner.subquery())
 
 
-def _parse_incremental_cursor_path(cursor_path: str) -> Tuple[Optional[str], str]:
+def parse_incremental_cursor_path(cursor_path: str) -> Tuple[Optional[str], str]:
     """Split `table.column` into parts, or return `(None, column)` for a bare field."""
-    if not cursor_path:
-        raise ValueError("Incremental `cursor_path` must be a non-empty string.")
-
-    # JSONPath wildcards, array indices, and `$` root markers cannot be pushed down to SQL
-    if any(ch in cursor_path for ch in ("$", "[", "*")):
-        raise ValueError(
-            f"Incremental `cursor_path={cursor_path!r}` is a JSONPath expression. "
-            "`Relation.incremental()` only supports plain `column` or `table.column` cursors."
-        )
-
-    invalid_msg = (
-        f"Incremental `cursor_path={cursor_path!r}` is not a plain column identifier. "
-        "Use `column` or `table.column`."
-    )
-
-    if "." in cursor_path:
-        table_part, column_part = cursor_path.rsplit(".", 1)
-        if not table_part:
-            raise ValueError(invalid_msg)
-    else:
-        table_part, column_part = None, cursor_path
-
+    table_part, _, column_part = cursor_path.rpartition(".")
     try:
-        column_name = extract_simple_field_name(column_part)
-    except JSONPathError as e:
-        raise ValueError(invalid_msg) from e
+        column_name = extract_simple_field_name(column_part) if column_part else None
+        # the table part must be a plain name too — rejects JSONPath roots, wildcards and indices
+        if "." in cursor_path and extract_simple_field_name(table_part) != table_part:
+            column_name = None
+    except JSONPathError:
+        column_name = None
     if column_name is None:
-        raise ValueError(invalid_msg)
-    return table_part, column_name
+        raise ValueError(
+            f"Incremental `cursor_path={cursor_path!r}` is not supported by"
+            " `Relation.incremental()`, which accepts plain `column` or `table.column`"
+            " cursors, not JSONPath expressions."
+        )
+    return table_part or None, column_name
 
 
 def _build_incremental_condition(
@@ -120,6 +108,8 @@ def _build_incremental_condition(
     column_ref: sge.Column,
     sqlglot_type: Optional[sge.DataType],
     destination_capabilities: Optional[DestinationCapabilitiesContext] = None,
+    range_start: Optional[TIncrementalRange] = None,
+    range_end: Optional[TIncrementalRange] = None,
 ) -> Optional[sge.Expression]:
     """Build the WHERE condition for an Incremental cursor on `column_ref`.
 
@@ -131,6 +121,8 @@ def _build_incremental_condition(
             bound literals; pass `None` to skip casting.
         destination_capabilities (Optional[DestinationCapabilitiesContext]): Caps used
             to shape timestamp literal format and CAST.
+        range_start (Optional[TIncrementalRange]): Overrides `incremental.range_start`.
+        range_end (Optional[TIncrementalRange]): Overrides `incremental.range_end`.
 
     Returns:
         Optional[sge.Expression]: A boolean expression ready to be attached via
@@ -140,15 +132,17 @@ def _build_incremental_condition(
         ValueError: If `incremental.last_value_func` is not `min` or `max`, or if
             `on_cursor_value_missing` is not one of `"include"`, `"exclude"`, `"raise"`.
     """
+    range_start = range_start or incremental.range_start
+    range_end = range_end or incremental.range_end
     last_value_func = incremental.last_value_func
     start_op_cls: Type[sge.Binary]
     end_op_cls: Type[sge.Binary]
     if last_value_func is max:
-        start_op_cls = sge.GTE if incremental.range_start == "closed" else sge.GT
-        end_op_cls = sge.LT if incremental.range_end == "open" else sge.LTE
+        start_op_cls = sge.GTE if range_start == "closed" else sge.GT
+        end_op_cls = sge.LT if range_end == "open" else sge.LTE
     elif last_value_func is min:
-        start_op_cls = sge.LTE if incremental.range_start == "closed" else sge.LT
-        end_op_cls = sge.GT if incremental.range_end == "open" else sge.GTE
+        start_op_cls = sge.LTE if range_start == "closed" else sge.LT
+        end_op_cls = sge.GT if range_end == "open" else sge.GTE
     else:
         raise ValueError(
             f"Incremental `last_value_func={last_value_func!r}` cannot be pushed "
@@ -197,7 +191,33 @@ def _build_incremental_condition(
     return sge.And(this=bounds, expression=is_not_null)
 
 
-def _apply_incremental(
+def _is_unique_cursor(incremental: Incremental[Any]) -> bool:
+    """True when the primary key is exactly the cursor column, so cursor values are unique."""
+    pk = incremental.primary_key
+    if not pk or callable(pk):
+        return False
+    cursor = incremental.get_cursor_column_name()
+    if not cursor:
+        return False
+    return ([pk] if isinstance(pk, str) else list(pk)) == [cursor]
+
+
+def _cursor_value_hash(value: Any) -> str:
+    """Dedup hash of a unique-cursor value: matches what the row transform computes
+    for a row when the primary key is the cursor column, so both modes interoperate."""
+    return digest128(json.dumps(value, sort_keys=True))
+
+
+def _boundary_consumed(incremental: Incremental[Any]) -> bool:
+    """True when state marks the row at `last_value` as already loaded, via the same
+    `unique_hashes` mechanism the row transform uses for boundary deduplication."""
+    state = incremental._cached_state
+    if not state or not state.get("unique_hashes"):
+        return False
+    return _cursor_value_hash(state["last_value"]) in state["unique_hashes"]
+
+
+def apply_incremental(
     *,
     incremental: Incremental[Any],
     target_query: sge.Query,
@@ -211,6 +231,22 @@ def _apply_incremental(
     column_name = column_ref.name
     sqlglot_type = _sqlglot_type_for_column(column_lookup_columns, column_name)
     _maybe_warn_on_cursor_missing_raise(incremental, column_lookup_columns, column_name)
+
+    range_start: Optional[TIncrementalRange] = None
+    range_end: Optional[TIncrementalRange] = None
+    unique_cursor = advance and incremental.end_value is None and _is_unique_cursor(incremental)
+    if unique_cursor:
+        # unique cursor: no more rows can arrive at a seen value, take the boundary eagerly
+        range_end = "closed"
+        # with lag the lower bound deliberately re-reads the attribution window
+        if not incremental.lag and _boundary_consumed(incremental):
+            # the boundary row at the lower bound was loaded by a previous run, skip it
+            range_start = "open"
+    elif advance and incremental.end_value is None:
+        if incremental.range_start == "open" and incremental.range_end == "open":
+            # an open start never replays the boundary row: take it eagerly,
+            # otherwise it could never load
+            range_end = "closed"
 
     if advance:
         if incremental.end_value is not None:
@@ -226,6 +262,7 @@ def _apply_incremental(
                 column_ref,
                 sqlglot_type,
                 destination_capabilities=destination_capabilities,
+                range_start=range_start,
             )
             filtered_query = (
                 target_query.where(lower_condition) if lower_condition is not None else target_query
@@ -237,30 +274,38 @@ def _apply_incremental(
                 destination_capabilities=destination_capabilities,
             )
             new_value = fetch_aggregate_scalar(agg_query)
-            if new_value is not None and (
-                incremental.range_end == "open"
-                and incremental.initial_value == incremental.start_value
-            ):
-                logger.warning(
-                    f"Boundary value {new_value} on cursor column"
-                    f" {incremental.cursor_path!r} will not be included in this"
-                    " run. SQL incremental does not support boundary"
-                    " deduplication, so the boundary row is deferred until state"
-                    " advances past it. To load it eagerly, set range_end='closed'"
-                    " and use write_disposition='merge' with a primary_key to"
-                    " dedup the overlap."
+            if new_value is not None and range_end != "closed" and incremental.range_end == "open":
+                # deduplicated by the default warnings filter: once per cursor and process
+                warnings.warn(
+                    f"Rows at the boundary value of cursor column {incremental.cursor_path!r}"
+                    " will not be included in this run. SQL incremental does not support"
+                    " boundary deduplication, so the boundary row is deferred until state"
+                    " advances past it. If the cursor column is unique, declare it as"
+                    " primary_key on the incremental to load boundary values eagerly."
+                    " Otherwise set range_end='closed' and use write_disposition='merge'"
+                    " with a primary_key to dedup the overlap.",
+                    UserWarning,
                 )
         incremental.advance(new_value)
+        if unique_cursor and new_value is not None:
+            # boundary row is included in this run: record its dedup hash exactly as the
+            # row transform does after loading rows at last_value
+            incremental._cached_state["unique_hashes"] = [_cursor_value_hash(new_value)]
 
     condition = _build_incremental_condition(
-        incremental, column_ref, sqlglot_type, destination_capabilities=destination_capabilities
+        incremental,
+        column_ref,
+        sqlglot_type,
+        destination_capabilities=destination_capabilities,
+        range_start=range_start,
+        range_end=range_end,
     )
     final_query = target_query.where(condition) if condition is not None else target_query
     ctx = _RelationIncrementalContext(incremental=incremental, cursor_column=column_ref.copy())
     return final_query, ctx
 
 
-def _raise_incomplete_cursor_column(cursor_path: str, location_label: str) -> None:
+def raise_incomplete_cursor_column(cursor_path: str, location_label: str) -> None:
     raise ValueError(
         f"Incremental cursor `{cursor_path}` is not a materialized column on "
         f"{location_label}. Columns declared as hints without a `data_type` cannot "

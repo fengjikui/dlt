@@ -49,6 +49,30 @@ def test_explicit_context_with_pendulum() -> None:
     assert ctx.interval == (start, end)
 
 
+def test_explicit_context_with_plain_tuple() -> None:
+    """A plain (start, end) tuple is accepted and normalized to TTimeInterval, so
+    `.start`/`.end` work the same as when a TTimeInterval is passed."""
+    start = pendulum.datetime(2024, 6, 1, tz="UTC")
+    end = pendulum.datetime(2024, 6, 2, tz="UTC")
+
+    # constructor accepts a plain tuple
+    ctx = TimeIntervalContext(interval=(start, end))
+    assert isinstance(ctx.interval, TTimeInterval)
+    assert ctx.interval == (start, end)
+    assert ctx.interval.start == start
+    assert ctx.interval.end == end
+
+    # setter accepts a plain tuple too
+    ctx.interval = (start, end)
+    assert isinstance(ctx.interval, TTimeInterval)
+
+    # dlt.current.interval.set() normalizes as well
+    with Container().injectable_context(TimeIntervalContext()):
+        _interval_accessor.set((start, end))
+        assert isinstance(_interval_accessor(), TTimeInterval)
+        assert _interval_accessor() == (start, end)
+
+
 def test_no_interval_when_empty() -> None:
     with patch.dict(os.environ, {}, clear=True):
         os.environ.pop("DLT_INTERVAL_START", None)

@@ -14,7 +14,7 @@ from dlt.common.pendulum import pendulum
 from dlt.dataset._incremental import (
     _build_incremental_aggregate,
     _build_incremental_condition,
-    _parse_incremental_cursor_path,
+    parse_incremental_cursor_path,
     _RelationIncrementalContext,
 )
 
@@ -875,26 +875,28 @@ def test_incremental_rejects_jsonpath_cursor(
 
 
 @pytest.mark.parametrize(
-    "cursor_path,match",
+    "cursor_path",
     [
-        pytest.param("", "non-empty string", id="empty"),
-        pytest.param("col.", "not a plain column identifier", id="trailing-dot"),
-        pytest.param(".col", "not a plain column identifier", id="leading-dot"),
-        pytest.param('"col with.dot"', "not a plain column identifier", id="quoted-with-dot"),
-        pytest.param("$.name", "JSONPath expression", id="jsonpath-root"),
-        pytest.param("items[0]", "JSONPath expression", id="array-index"),
+        pytest.param("", id="empty"),
+        pytest.param("col.", id="trailing-dot"),
+        pytest.param(".col", id="leading-dot"),
+        pytest.param('"col with.dot"', id="quoted-with-dot"),
+        pytest.param("$.name", id="jsonpath-root"),
+        pytest.param("items[0]", id="array-index"),
+        pytest.param("a.b.c", id="nested-table-path"),
+        pytest.param("events[*].col", id="jsonpath-table-part"),
     ],
 )
-def test_parse_incremental_cursor_path_rejects_malformed(cursor_path: str, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        _parse_incremental_cursor_path(cursor_path)
+def test_parse_incremental_cursor_path_rejects_malformed(cursor_path: str) -> None:
+    with pytest.raises(ValueError, match="is not supported"):
+        parse_incremental_cursor_path(cursor_path)
 
 
 def test_incremental_rejects_quoted_cursor_with_inner_dot(
     incremental_dataset: dlt.Dataset,
 ) -> None:
     incremental = dlt.sources.incremental('"col with.dot"', initial_value=1)
-    with pytest.raises(ValueError, match="not a plain column identifier"):
+    with pytest.raises(ValueError, match="is not supported"):
         incremental_dataset.table("events").incremental(incremental)
 
 

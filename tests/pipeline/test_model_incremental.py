@@ -50,34 +50,43 @@ def _model_transformer(
     *,
     cursor_path: str = "id",
     start_value: Any = 0,
+    initial_value: Any = None,
     end_value: Any = None,
     last_value_func: Any = max,
     range_start: Literal["open", "closed"] = "open",
     range_end: Literal["open", "closed"] = "open",
+    primary_key: Any = None,
+    boundary_consumed: bool = False,
 ) -> ModelIncremental:
+    # initial_value defaults to start_value (a fresh, not yet advanced state)
+    if initial_value is None:
+        initial_value = start_value
     parent: dlt.sources.incremental[Any] = dlt.sources.incremental(
         cursor_path,
-        initial_value=start_value,
+        initial_value=initial_value,
         end_value=end_value,
+        primary_key=primary_key,
         last_value_func=last_value_func,
         range_start=range_start,
         range_end=range_end,
     )
     parent._cached_state = {
-        "initial_value": start_value,
+        "initial_value": initial_value,
         "last_value": start_value,
         "start_value": start_value,
-        "unique_hashes": [],
+        # the dedup marker for the row at last_value, as written by an eager unique
+        # cursor advance or by the row transform loading the boundary row
+        "unique_hashes": [_cursor_value_hash(start_value)] if boundary_consumed else [],
     }
     parent.start_value = start_value
     transformer = ModelIncremental(
         resource_name="test",
         cursor_path=cursor_path,
-        initial_value=start_value,
+        initial_value=initial_value,
         start_value=start_value,
         end_value=end_value,
         last_value_func=last_value_func,
-        primary_key=None,
+        primary_key=primary_key,
         unique_hashes=set(),
         range_start=range_start,
         range_end=range_end,
@@ -151,7 +160,9 @@ def test_advances_to_end_value_when_set(incremental_pipeline: dlt.Pipeline) -> N
 @pytest.mark.parametrize(
     "range_start,range_end,expected_ids",
     [
-        pytest.param("open", "open", [3, 4], id="open-open"),
+        # open start never replays the boundary: the synthesized upper is coerced to
+        # closed so the boundary row is not lost — same rows as open-closed
+        pytest.param("open", "open", [3, 4, 5], id="open-open-coerced-eager"),
         pytest.param("open", "closed", [3, 4, 5], id="open-closed"),
         pytest.param("closed", "open", [2, 3, 4], id="closed-open"),
         pytest.param("closed", "closed", [2, 3, 4, 5], id="closed-closed"),
@@ -176,6 +187,102 @@ def test_stateful_advances_state_across_range_modifiers(
     assert transformer.last_value == 5
     rows = sorted(int(r[0]) for r in out.select("id").fetchall())
     assert rows == expected_ids
+
+
+@pytest.mark.parametrize(
+    "primary_key,start_value,initial_value,expected_ids",
+    [
+        # fresh state: user's closed start keeps initial_value, end overridden to <= MAX
+        pytest.param("id", 0, 0, [1, 2, 3, 4, 5], id="eager-boundary-first-window"),
+        # advanced state: lower goes strict so the already-loaded boundary never replays
+        pytest.param("id", 3, 0, [4, 5], id="strict-lower-advanced-window"),
+        pytest.param(("id",), 0, 0, [1, 2, 3, 4, 5], id="tuple-pk-eager"),
+        # composite or missing pk does not imply uniqueness: ranges unchanged (>= 0, < 5)
+        pytest.param(("id", "value"), 0, 0, [1, 2, 3, 4], id="composite-pk-unchanged"),
+        pytest.param(None, 0, 0, [1, 2, 3, 4], id="no-pk-unchanged"),
+    ],
+)
+def test_unique_cursor_takes_boundary_eagerly(
+    incremental_pipeline: dlt.Pipeline,
+    primary_key: Any,
+    start_value: int,
+    initial_value: int,
+    expected_ids: list[int],
+) -> None:
+    """A primary key equal to the cursor declares cursor values unique: the boundary
+    value is complete once seen, so it loads eagerly (closed end) and an advanced
+    lower bound goes strict (open start) instead of replaying."""
+    relation = incremental_pipeline.dataset().table("events")
+    transformer = _model_transformer(
+        start_value=start_value,
+        initial_value=initial_value,
+        range_start="closed",
+        range_end="open",
+        primary_key=primary_key,
+    )
+    out, _, _ = transformer(relation)
+
+    assert transformer.last_value == 5
+    rows = sorted(int(r[0]) for r in out.select("id").fetchall())
+    assert rows == expected_ids
+
+
+@pytest.mark.parametrize(
+    "incremental_kwargs,batches,expected_per_run",
+    [
+        # boundary row defers one cycle, late arrival at the watermark (id 4, ts 200)
+        # loads exactly once, run without new data loads nothing, 6 stays deferred
+        pytest.param(
+            {},
+            [[(1, 100), (2, 100), (3, 200)], [(4, 200), (5, 300)], [], [(6, 400)]],
+            [[1, 2], [3, 4], [], [5]],
+            id="default-ranges-deferred-tiling",
+        ),
+        # primary key equal to the cursor: boundary loads eagerly and never replays
+        pytest.param(
+            {"primary_key": "ts"},
+            [[(1, 100), (2, 150), (3, 200)], [(4, 250), (5, 300)], [], [(6, 400)]],
+            [[1, 2, 3], [4, 5], [], [6]],
+            id="unique-cursor-eager",
+        ),
+    ],
+)
+def test_multi_run_windows_tile_e2e(
+    tmp_path: pathlib.Path,
+    incremental_kwargs: dict[str, Any],
+    batches: list[list[tuple[int, int]]],
+    expected_per_run: list[list[int]],
+) -> None:
+    """Across pipeline runs the stateful windows tile the cursor axis: every row loads
+    exactly once with append and state advances through real pipeline state."""
+    pipeline = dlt.pipeline(
+        pipeline_name="multi_run_e2e",
+        pipelines_dir=str(tmp_path / "pipelines_dir"),
+        destination=dlt.destinations.duckdb(str(tmp_path / "multi_run.db")),
+        dev_mode=True,
+    )
+
+    @dlt.resource(name="events", primary_key="id", write_disposition="append")
+    def raw_events(rows: list[tuple[int, int]]) -> Iterator[Any]:
+        yield [{"id": i, "ts": ts} for i, ts in rows]
+
+    captured: list[list[int]] = []
+
+    @dlt.resource(name="downstream")
+    def downstream(
+        cursor: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "ts", initial_value=0, on_cursor_value_missing="exclude", **incremental_kwargs
+        ),
+    ) -> Iterator[Any]:
+        out = cursor(pipeline.dataset().table("events"))
+        captured.append(sorted(int(r[0]) for r in out.select("id").fetchall()))
+        yield from []
+
+    for batch, expected in zip(batches, expected_per_run):
+        if batch:
+            pipeline.run(raw_events(batch))
+        pipeline.run(downstream())
+        assert captured[-1] == expected
 
 
 def test_auto_applies_on_bare_relation(incremental_pipeline: dlt.Pipeline) -> None:
@@ -254,6 +361,6 @@ def test_aggregate_with_inner_and_outer(incremental_pipeline: dlt.Pipeline) -> N
 
     # MAX(id) over inner-filtered rows
     assert transformer.last_value == 5
-    # combined WHERE: value >= 3.0 (inner) AND id > 0 AND id < 5 (outer bounded)
+    # combined WHERE: value >= 3.0 (inner) AND id > 0 AND id <= 5 (open-open coerced eager)
     rows = sorted(int(r[0]) for r in out.select("id").fetchall())
-    assert rows == [3, 4]
+    assert rows == [3, 4, 5]
